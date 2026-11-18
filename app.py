@@ -1,27 +1,15 @@
 import streamlit as st
 import pandas as pd
 from datetime import date
-import os
-
-# --- QUẢN LÝ FILE LƯU TRỮ VĨNH VIỄN ---
-DATA_FILE = "dulieu_thono.csv"
-
-def load_data():
-    if os.path.exists(DATA_FILE):
-        return pd.read_csv(DATA_FILE)
-    else:
-        df = pd.DataFrame(columns=['Tên khách nợ', 'Số tiền (VND)', 'Đã thu (VND)', 'Ngày hẹn trả', 'Trạng thái', 'Ghi chú'])
-        df.to_csv(DATA_FILE, index=False)
-        return df
-
-def save_data(df):
-    df.to_csv(DATA_FILE, index=False)
+from streamlit_gsheets import GSheetsConnection
 
 def format_vnd(amount):
-    return f"{amount:,.0f}".replace(',', '.') + " đ"
+    if pd.isna(amount):
+        return "0 đ"
+    return f"{float(amount):,.0f}".replace(',', '.') + " đ"
 
 # 1. Cấu hình giao diện
-st.set_page_config(page_title="Sổ Thu Nợ", page_icon="📝", layout="centered")
+st.set_page_config(page_title="Sổ Thu Nợ Công Ty", page_icon="📝", layout="centered")
 
 st.markdown("""
     <style>
@@ -33,14 +21,35 @@ st.markdown("""
 
 st.title("📝 Sổ Quản Lý Thu Nợ")
 
-# Đọc dữ liệu
-if 'debts' not in st.session_state:
-    st.session_state.debts = load_data()
+# Kết nối với Google Sheets
+conn = st.connection("gsheets", type=GSheetsConnection)
+COLS = ['Tên khách nợ', 'Số tiền (VND)', 'Đã thu (VND)', 'Ngày hẹn trả', 'Trạng thái', 'Ghi chú']
+
+def load_data():
+    try:
+        # ttl=0 đảm bảo luôn lấy dữ liệu mới nhất từ Google Sheets, không dùng bộ nhớ đệm cũ
+        df = conn.read(worksheet="Trang tính1", ttl=0)
+        df = df.dropna(how="all") # Loại bỏ các dòng trống
+        if df.empty:
+            return pd.DataFrame(columns=COLS)
+        # Đảm bảo cột tiền luôn là dạng số để tính toán
+        df['Số tiền (VND)'] = pd.to_numeric(df['Số tiền (VND)'], errors='coerce').fillna(0.0)
+        df['Đã thu (VND)'] = pd.to_numeric(df['Đã thu (VND)'], errors='coerce').fillna(0.0)
+        return df
+    except Exception:
+        return pd.DataFrame(columns=COLS)
+
+def save_data(df):
+    # Chuyển ngày tháng về dạng chữ trước khi đẩy lên Google Sheets để tránh lỗi định dạng
+    save_df = df.copy()
+    if 'Ngày hẹn trả' in save_df.columns:
+        save_df['Ngày hẹn trả'] = save_df['Ngày hẹn trả'].astype(str)
+    conn.update(worksheet="Trang tính1", data=save_df)
 
 # ==========================================
 # PHẦN HIỂN THỊ TỔNG QUAN
 # ==========================================
-df = load_data() 
+df = load_data()
 tong_no = df['Số tiền (VND)'].sum() if not df.empty else 0
 da_thu = df['Đã thu (VND)'].sum() if not df.empty else 0
 con_lai = tong_no - da_thu
@@ -59,10 +68,9 @@ tab1, tab2, tab3 = st.tabs(["💰 Nhập tiền thu", "➕ Thêm nợ mới", "�
 
 with tab1:
     st.subheader("Cập nhật xác nhận tiền thu")
-    current_df = load_data()
-    if not current_df.empty:
+    if not df.empty:
         with st.form("thu_tien_form", clear_on_submit=True):
-            danh_sach_khach = current_df['Tên khách nợ'].tolist()
+            danh_sach_khach = df['Tên khách nợ'].dropna().tolist()
             khach_hang = st.selectbox("Chọn người trả tiền *", danh_sach_khach)
             so_tien_tra = st.number_input("Số tiền khách trả đợt này (VND) *", min_value=0.0, step=50000.0)
             
@@ -80,8 +88,7 @@ with tab1:
                         fresh_df.at[idx, 'Trạng thái'] = "✅ Đã thu xong"
                     
                     save_data(fresh_df)
-                    st.session_state.debts = fresh_df
-                    st.success(f"✅ Đã ghi nhận: {khach_hang} vừa thanh toán {format_vnd(so_tien_tra)}!")
+                    st.success(f"✅ Đã lưu lên Google Sheets: {khach_hang} vừa thanh toán {format_vnd(so_tien_tra)}!")
                     st.rerun()
                 else:
                     st.error("⚠️ Vui lòng nhập số tiền lớn hơn 0!")
@@ -92,7 +99,7 @@ with tab2:
     with st.form("add_debt_form", clear_on_submit=True):
         name = st.text_input("Tên người nợ / Khách hàng *")
         amount = st.number_input("Số tiền nợ (VND) *", min_value=0.0, step=100000.0)
-        st.markdown(f"💵 *Số tiền đang nhập:* **:blue[{format_vnd(amount)}]**")
+        st.markdown(f"💵 *Số tiền bạn đang nhập:* **:blue[{format_vnd(amount)}]**")
         
         date_due = st.date_input("Ngày hẹn trả", date.today())
         note = st.text_input("Ghi chú (SĐT, lý do...)")
@@ -111,18 +118,17 @@ with tab2:
                 fresh_df = pd.concat([fresh_df, new_row], ignore_index=True)
                 
                 save_data(fresh_df)
-                st.session_state.debts = fresh_df
-                st.success(f"✅ Đã thêm khoản nợ của {name} với số tiền {format_vnd(amount)}!")
+                st.success(f"✅ Đã lưu khoản nợ của {name} ({format_vnd(amount)}) lên Google Sheets!")
                 st.rerun()
 
 with tab3:
     st.caption("Bảng theo dõi chi tiết. Sửa trạng thái bằng cách chạm vào ô tương ứng.")
-    current_df = load_data()
-    if not current_df.empty:
-        current_df['Ngày hẹn trả'] = pd.to_datetime(current_df['Ngày hẹn trả'], format='mixed', errors='coerce').dt.date
+    if not df.empty:
+        display_df = df.copy()
+        display_df['Ngày hẹn trả'] = pd.to_datetime(display_df['Ngày hẹn trả'], format='mixed', errors='coerce').dt.date
         
         edited_df = st.data_editor(
-            current_df,
+            display_df,
             column_config={
                 "Tên khách nợ": st.column_config.TextColumn("Người nợ", disabled=True),
                 "Số tiền (VND)": st.column_config.NumberColumn("Cần thu", disabled=True), 
@@ -136,25 +142,18 @@ with tab3:
         )
         if st.button("💾 LƯU SỬA ĐỔI BẢNG"):
             save_data(edited_df)
-            st.session_state.debts = edited_df
-            st.success("✅ Đã lưu thay đổi!")
+            st.success("✅ Đã cập nhật lên Google Sheets!")
             st.rerun()
             
-        # ==========================================
-        # TÍNH NĂNG MỚI: DỌN DẸP SỔ (XÓA KHOẢN NỢ)
-        # ==========================================
         st.divider()
         st.subheader("🗑️ Dọn dẹp sổ nợ")
-        st.caption("Dùng để xóa bỏ hoàn toàn những người đã trả hết nợ cho nhẹ sổ. Lưu ý: Thao tác này không thể hoàn tác.")
+        st.caption("Xóa bỏ hoàn toàn những người đã trả hết nợ cho nhẹ sổ.")
         
-        khach_xoa = st.selectbox("Chọn tên người muốn xóa khỏi sổ:", current_df['Tên khách nợ'].tolist())
+        khach_xoa = st.selectbox("Chọn tên người muốn xóa khỏi sổ:", df['Tên khách nợ'].dropna().tolist())
         
         if st.button("❌ XÁC NHẬN XÓA KHOẢN NỢ NÀY", type="primary"):
             fresh_df = load_data()
-            # Lọc và chỉ giữ lại những dòng có tên KHÁC với tên người vừa chọn xóa
             fresh_df = fresh_df[fresh_df['Tên khách nợ'] != khach_xoa]
-            
-            save_data(fresh_df) # Lưu bản cập nhật mới vào file
-            st.session_state.debts = fresh_df
+            save_data(fresh_df)
             st.success(f"✅ Đã xóa vĩnh viễn hồ sơ nợ của {khach_xoa}!")
             st.rerun()
